@@ -75,7 +75,7 @@ function setRol(rol) {
   mostrar("ventas", "none");
 
   if (rol === "admin") {
-    mostrar("admin", "block");
+    mostrar("admin", "flex");
 
     // cargar primera vista
     mostrarSeccion("inventario");
@@ -148,6 +148,49 @@ function actualizarTotal() {
   document.getElementById("total").innerText = formatoMiles(total);
   calcularCambio();
 }
+
+// 🔢 recalcula el total de CADA línea (precio x cantidad − descuento)
+// y el total general del carrito. Único lugar que decide estos números,
+// para que el descuento nunca quede desincronizado al sumar/restar.
+function recalcularCarrito() {
+  total = 0;
+
+  Object.values(carrito).forEach(item => {
+    const bruto = item.precio * item.cantidad;
+
+    let descuento = Number(item.descuento) || 0;
+    if (descuento < 0) descuento = 0;
+    if (descuento > bruto) descuento = bruto; // 🔒 no se puede descontar más que el total de la línea
+
+    item.descuento = descuento;
+    item.total = bruto - descuento;
+
+    total += item.total;
+  });
+}
+
+function cambiarDescuento(nombreProducto, valorTexto) {
+  const item = carrito[nombreProducto];
+  if (!item) return;
+
+  const limpio = Number(String(valorTexto).replace(/\D/g, "")) || 0;
+  item.descuento = limpio;
+
+  recalcularCarrito();
+  actualizarTotal();
+  actualizarCarrito();
+}
+
+// =====================
+// 🔤 NORMALIZAR NOMBRE
+// (para comparar productos ignorando espacios extra y mayúsculas/minúsculas)
+// =====================
+function normalizarNombre(nombre) {
+  return String(nombre || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
 // =====================
 // ➕ PRODUCTOS
 // =====================
@@ -159,7 +202,7 @@ async function agregarProducto(nombreProducto, precio) {
     return;
   }
 
-  // 🔍 CONSULTAR INVENTARIO REAL
+  // 🔍 CONSULTAR INVENTARIO REAL (suma todos los lotes del producto)
   const snapshot = await db.collection("inventario")
     .where("nombreProducto", "==", nombreProducto)
     .get();
@@ -168,8 +211,10 @@ async function agregarProducto(nombreProducto, precio) {
     return mostrarMensaje("Producto no encontrado en inventario");
   }
 
-  const data = snapshot.docs[0].data();
-  const cantidadDisponible = data.cantidad || 0;
+  const cantidadDisponible = snapshot.docs.reduce(
+    (acc, doc) => acc + (Number(doc.data().cantidad) || 0),
+    0
+  );
 
   // 🔥 BLOQUEO REAL
   if (cantidadDisponible <= 0) {
@@ -186,18 +231,17 @@ async function agregarProducto(nombreProducto, precio) {
   // ✅ AGREGAR NORMAL
   if (carrito[nombreProducto]) {
     carrito[nombreProducto].cantidad++;
-    carrito[nombreProducto].total += precio;
   } else {
     carrito[nombreProducto] = {
       nombreProducto,
       precio,
       cantidad: 1,
+      descuento: 0,
       total: precio
     };
   }
 
-  total += precio;
-
+  recalcularCarrito();
   actualizarTotal();
   actualizarCarrito();
 }
@@ -212,6 +256,7 @@ function actualizarCarrito() {
         <th>Producto</th>
         <th>Cantidad</th>
         <th>Unidad</th>
+        <th>Descuento</th>
         <th>Total</th>
         <th>❌</th>
       </tr>
@@ -229,6 +274,15 @@ function actualizarCarrito() {
           </div>
         </td>
         <td>$${formatoMiles(item.precio)}</td>
+        <td>
+          <input
+            type="text"
+            value="${item.descuento ? formatoMiles(item.descuento) : ""}"
+            placeholder="$0"
+            style="width:80px;text-align:center;"
+            oninput="formatearInput(this)"
+            onchange="cambiarDescuento('${item.nombreProducto}', this.value)">
+        </td>
         <td>$${formatoMiles(item.total)}</td>
         <td>
           <button onclick="eliminarProducto('${item.nombreProducto}')">❌</button>
@@ -266,7 +320,7 @@ async function sumarProducto(nombreProducto) {
 
   if (!item) return;
 
-  // 🔍 consultar inventario
+  // 🔍 consultar inventario (suma todos los lotes del producto)
   const snapshot = await db.collection("inventario")
     .where("nombreProducto", "==", nombreProducto)
     .get();
@@ -275,8 +329,10 @@ async function sumarProducto(nombreProducto) {
     return mostrarMensaje("Producto no encontrado");
   }
 
-  const data = snapshot.docs[0].data();
-  const disponible = data.cantidad || 0;
+  const disponible = snapshot.docs.reduce(
+    (acc, doc) => acc + (Number(doc.data().cantidad) || 0),
+    0
+  );
 
   // 🔥 VALIDACIÓN CLAVE
   if (item.cantidad >= disponible) {
@@ -285,9 +341,8 @@ async function sumarProducto(nombreProducto) {
 
   // ✅ aumentar
   item.cantidad++;
-  item.total += item.precio;
-  total += item.precio;
 
+  recalcularCarrito();
   actualizarCarrito();
   actualizarTotal();
 }
@@ -296,11 +351,10 @@ function restarProducto(nombre) {
   const item = carrito[nombre];
 
   item.cantidad--;
-  item.total -= item.precio;
-  total -= item.precio;
 
   if (item.cantidad <= 0) delete carrito[nombre];
 
+  recalcularCarrito();
   actualizarTotal();
   actualizarCarrito();
 }
@@ -311,9 +365,9 @@ function restarProducto(nombre) {
 function eliminarProducto(nombre) {
   if (!carrito[nombre]) return;
 
-  total -= carrito[nombre].total;
   delete carrito[nombre];
 
+  recalcularCarrito();
   actualizarTotal();
   actualizarCarrito();
 }
@@ -391,8 +445,254 @@ function cambiarMetodoPago() {
 }
 
 // =====================
+// 📉 DESCONTAR INVENTARIO TRAS UNA VENTA
+// =====================
+async function descontarInventario(nombreProducto, cantidadVendida, idTransaccion) {
+  const snapshot = await db.collection("inventario")
+    .where("nombreProducto", "==", nombreProducto)
+    .get();
+
+  if (snapshot.empty) return;
+
+  // 🔥 orden FIFO: se descuenta primero del ingreso más antiguo
+  const docs = snapshot.docs.slice().sort((a, b) => {
+    const fa = a.data().fecha || "";
+    const fb = b.data().fecha || "";
+    return fa < fb ? -1 : fa > fb ? 1 : 0;
+  });
+
+  let restante = cantidadVendida;
+
+  for (const doc of docs) {
+    if (restante <= 0) break;
+
+    const montoDeseado = restante; // fijo ANTES de entrar a la transacción
+
+    const descontado = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(doc.ref);
+      const actual = snap.data().cantidad || 0;
+
+      if (actual <= 0) return 0;
+
+      const descuento = Math.min(actual, montoDeseado);
+      tx.update(doc.ref, { cantidad: actual - descuento });
+
+      return descuento;
+    });
+
+    restante -= descontado;
+
+    if (descontado > 0 && typeof registrarMovimiento === "function") {
+      const sku = doc.data().sku || "-";
+
+      await registrarMovimiento({
+        nombreProducto,
+        tipo: "venta",
+        cantidad: descontado,
+        referencia: `${idTransaccion || "-"} (SKU ${sku})`
+      });
+    }
+  }
+
+  await sincronizarStockProducto(nombreProducto);
+}
+
+// 🔄 recalcula el stock total (suma de todos los ingresos) y lo refleja en "productos"
+async function sincronizarStockProducto(nombreProducto) {
+  const invSnap = await db.collection("inventario")
+    .where("nombreProducto", "==", nombreProducto)
+    .get();
+
+  let stockTotal = 0;
+  invSnap.forEach(doc => {
+    stockTotal += Number(doc.data().cantidad) || 0;
+  });
+
+  const prodSnap = await db.collection("productos")
+    .where("nombreProducto", "==", nombreProducto)
+    .get();
+
+  const actualizaciones = prodSnap.docs.map(doc =>
+    doc.ref.update({
+      stock: stockTotal,
+      activo: stockTotal > 0
+    })
+  );
+
+  await Promise.all(actualizaciones);
+
+  // 🔔 mantener el badge de alertas de stock al día en el panel admin
+  if (typeof cargarAlertasStock === "function") {
+    cargarAlertasStock();
+  }
+}
+
+// =====================
+// 🧾 ID DE TRANSACCIÓN (VT-00001, VT-00002, ...)
+// =====================
+const PREFIJO_VENTA = "VT-";
+const DIGITOS_VENTA = 5;
+
+async function generarSiguienteIdVenta() {
+  const ref = db.collection("contadores").doc("venta");
+
+  const nuevoId = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const ultimo = snap.exists ? (snap.data().ultimo || 0) : 0;
+    const siguiente = ultimo + 1;
+
+    tx.set(ref, { ultimo: siguiente }, { merge: true });
+
+    return PREFIJO_VENTA + String(siguiente).padStart(DIGITOS_VENTA, "0");
+  });
+
+  return nuevoId;
+}
+
+// =====================
+// 🧾 RECIBO DE VENTA (imprimir / guardar como PDF)
+// =====================
+function generarReciboHTML(venta, idTransaccion) {
+  const fecha = new Date();
+
+  const productosFilas = venta.productos.map(p => `
+    <div class="item">
+      <div class="item-nombre">${p.nombreProducto}</div>
+      <div class="item-detalle">
+        <span>${p.cantidad} x $${formatoMiles(p.precio)}</span>
+        <span>$${formatoMiles(p.total)}</span>
+      </div>
+    </div>
+  `).join("");
+
+  const descuentoTotal = venta.productos.reduce(
+    (acc, p) => acc + (Number(p.descuento) || 0), 0
+  );
+
+  return `
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Recibo ${idTransaccion || ""}</title>
+      <style>
+        @page {
+          size: 58mm auto;
+          margin: 0;
+        }
+        body {
+          font-family: 'Courier New', monospace;
+          width: 58mm;
+          margin: 0 auto;
+          padding: 2mm;
+          color: #000;
+          font-size: 12.5px;
+          font-weight: 600;
+          line-height: 1.4;
+          -webkit-font-smoothing: antialiased;
+        }
+        h2 { text-align: center; margin: 0 0 2px; font-size: 14px; }
+        .centro { text-align: center; }
+        .linea { border-top: 1px dashed #000; margin: 6px 0; }
+        .item { margin-bottom: 4px; }
+        .item-nombre { font-weight: bold; }
+        .item-detalle { display: flex; justify-content: space-between; }
+        .totales p { display: flex; justify-content: space-between; margin: 2px 0; }
+        .totales p.total-final { font-weight: bold; font-size: 12.5px; }
+        .btn-imprimir {
+          display: block;
+          width: 100%;
+          margin-top: 10px;
+          padding: 8px;
+          font-size: 12px;
+          cursor: pointer;
+        }
+        @media print {
+          .btn-imprimir { display: none; }
+          body { width: 58mm; padding: 1mm; }
+        }
+      </style>
+    </head>
+    <body>
+      <h2>A|P Geek Figures</h2>
+      <p class="centro">Recibo de venta</p>
+      <p class="centro">${idTransaccion || "-"}</p>
+      <p class="centro">${fecha.toLocaleString("es-CO")}</p>
+
+      <div class="linea"></div>
+
+      ${productosFilas}
+
+      <div class="linea"></div>
+
+      <div class="totales">
+        ${descuentoTotal > 0 ? `<p><span>Descuento</span><span>-$${formatoMiles(descuentoTotal)}</span></p>` : ""}
+        <p class="total-final"><span>TOTAL</span><span>$${formatoMiles(venta.total)}</span></p>
+        <p><span>Método de pago</span><span>${capitalizarPrimera(venta.metodoPago)}</span></p>
+        ${venta.metodoPago === "efectivo" ? `<p><span>Cambio</span><span>$${formatoMiles(venta.cambio || 0)}</span></p>` : ""}
+      </div>
+
+      <div class="linea"></div>
+      <p class="centro">¡Gracias por tu compra!</p>
+
+      <button class="btn-imprimir" onclick="window.print()">🖨️ Imprimir / Guardar como PDF</button>
+    </body>
+    </html>
+  `;
+}
+
+function mostrarRecibo(venta, idTransaccion) {
+  const ventana = window.open("", "_blank", "width=280,height=600");
+
+  if (!ventana) {
+    mostrarMensaje("Habilita las ventanas emergentes para ver el recibo");
+    return;
+  }
+
+  ventana.document.write(generarReciboHTML(venta, idTransaccion));
+  ventana.document.close();
+}
+
+// =====================
 // 💾 VENTA
 // =====================
+// =====================
+// 💰 COSTO PROMEDIO (para reportes de utilidad)
+// =====================
+async function obtenerCostoPromedio(nombreProducto) {
+  const snapshot = await db.collection("inventario")
+    .where("nombreProducto", "==", nombreProducto)
+    .get();
+
+  if (snapshot.empty) return 0;
+
+  let sumaCosto = 0;
+  let sumaCantidad = 0;
+
+  snapshot.forEach(doc => {
+    const d = doc.data();
+    const cantidad = Number(d.cantidad) || 0;
+    const costo = Number(d.costoUnitario) || 0;
+
+    if (cantidad > 0) {
+      sumaCosto += costo * cantidad;
+      sumaCantidad += cantidad;
+    }
+  });
+
+  if (sumaCantidad > 0) return sumaCosto / sumaCantidad;
+
+  // 🔒 fallback: si ya no queda cantidad positiva en ningún lote,
+  // se promedia el costo de todos los lotes sin ponderar
+  let total = 0;
+  let n = 0;
+  snapshot.forEach(doc => {
+    total += Number(doc.data().costoUnitario) || 0;
+    n++;
+  });
+
+  return n > 0 ? total / n : 0;
+}
+
 async function guardarVenta(btn) {
   if (btn.disabled) return;
 
@@ -441,16 +741,40 @@ async function guardarVenta(btn) {
       }
     }
 
+    // 💰 capturar el costo promedio de cada producto AL MOMENTO de la venta
+    // (para que el reporte de utilidad no dependa del costo actual del inventario)
+    for (const item of productos) {
+      item.costoUnitario = await obtenerCostoPromedio(item.nombreProducto);
+    }
+
+    // 🔢 ID de transacción secuencial y atómico (VT-00001, VT-00002, ...)
+    const idTransaccion = await generarSiguienteIdVenta();
+
     // ✅ GUARDAR VENTA
     await db.collection("ventas").add({
+      idTransaccion,
       productos,
       metodoPago: metodo,
       total,
       cambio: cambioFinal,
+      nombreCliente: nombreCliente || "",
+      cedulaCliente: cedulaCliente || "",
       fecha: new Date()
     });
 
-    mostrarMensaje("Venta guardada ✅");
+    // 📉 DESCONTAR DEL INVENTARIO LO QUE SE ACABA DE VENDER
+    for (const item of productos) {
+      await descontarInventario(item.nombreProducto, item.cantidad, idTransaccion);
+    }
+
+    mostrarMensaje(`Venta guardada ✅ (${idTransaccion})`);
+
+    // 🧾 recibo: ventana emergente, el vendedor decide si imprime/guarda PDF o la cierra
+    mostrarRecibo({ productos, total, metodoPago: metodo, cambio: cambioFinal }, idTransaccion);
+
+    // 🔄 refrescar la vista de productos para reflejar el stock actualizado
+    // (sin esto, el vendedor seguía viendo cantidades viejas hasta recargar)
+    await refrescarVistaProductos();
 
     // 🧹 LIMPIAR TODO EL SISTEMA
     carrito = {};
@@ -523,23 +847,62 @@ if (input) {
   input.dispatchEvent(new Event("input")); // 🔥 recalcula cambio en vivo
 }
 //Filtrar productos 
-function filtrarProductos() {
+function quitarTildes(texto) {
+  return String(texto || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+// 🔍 Búsqueda GLOBAL: funciona escribas o no hayas entrado a una categoría
+async function filtrarProductos() {
   const input = document.getElementById("buscador");
   if (!input) return;
 
-  const filtro = input.value.toLowerCase();
+  const filtro = quitarTildes(input.value.trim().toLowerCase());
 
-  const contenedor = document.getElementById("listaProductos");
-  if (!contenedor) return;
+  // 🔙 campo vacío = volver a ver categorías
+  if (filtro === "") {
+    volverCategorias();
+    return;
+  }
 
-  const botones = contenedor.querySelectorAll("button");
+  document.getElementById("categoriasProductos").style.display = "none";
 
-  botones.forEach(btn => {
-    btn.style.display =
-      btn.innerText.toLowerCase().includes(filtro)
-        ? "block"
-        : "none";
-  });
+  const [snapshot, invSnapshot] = await Promise.all([
+    db.collection("productos").get(),
+    db.collection("inventario").get()
+  ]);
+
+  const productosFiltrados = snapshot.docs
+    .map(doc => doc.data())
+    .filter(p =>
+      p.nombreProducto &&
+      quitarTildes(p.nombreProducto.toLowerCase()).includes(filtro)
+    );
+
+  renderListaProductos(productosFiltrados, invSnapshot);
+}
+
+// 🕐 debounce: espera 300ms de pausa al escribir antes de consultar Firestore
+let debounceBuscador = null;
+function onEscribirBuscador() {
+  clearTimeout(debounceBuscador);
+  debounceBuscador = setTimeout(filtrarProductos, 300);
+}
+
+// 🔒 se auto-conecta al escribir, sin depender de que el HTML tenga oninput
+function conectarBuscador() {
+  const buscador = document.getElementById("buscador");
+  if (buscador && !buscador.dataset.conectado) {
+    buscador.addEventListener("input", onEscribirBuscador);
+    buscador.dataset.conectado = "1"; // evita conectar el listener dos veces
+  }
+}
+
+if (document.readyState === "loading") {
+  window.addEventListener("DOMContentLoaded", conectarBuscador);
+} else {
+  conectarBuscador();
 }
 function cargarProductos() {
   db.collection("productos").onSnapshot(snapshot => {
@@ -627,15 +990,36 @@ async function cargarCategoriasProductos() {
   document.getElementById("categoriasProductos").innerHTML = html;
 }
 //Mostrar productos por categoria
+let categoriaActualVendedor = null;
+
 async function mostrarProductosCategoria(categoria) {
+
+  categoriaActualVendedor = categoria;
 
   // Ocultar categorías
   document.getElementById("categoriasProductos").style.display = "none";
 
-  const snapshot = await db.collection("productos")
-    .where("categoria", "==", categoria)
-    .get();
-    
+  const [snapshot, invSnapshot] = await Promise.all([
+    db.collection("productos").where("categoria", "==", categoria).get(),
+    db.collection("inventario").get()
+  ]);
+
+  renderListaProductos(snapshot.docs.map(d => d.data()), invSnapshot);
+}
+
+// 🔁 Renderer compartido entre "ver por categoría" y "buscar"
+function renderListaProductos(productos, invSnapshot) {
+
+  // 📦 Stock real por nombre de producto (normalizado, sumando todos los ingresos de inventario)
+  const stockPorProducto = {};
+  invSnapshot.forEach(doc => {
+    const inv = doc.data();
+    if (!inv.nombreProducto) return;
+    const clave = normalizarNombre(inv.nombreProducto);
+    stockPorProducto[clave] =
+      (stockPorProducto[clave] || 0) + (Number(inv.cantidad) || 0);
+  });
+
   let html = `
   <button
     class="btn-volver"
@@ -644,30 +1028,72 @@ async function mostrarProductosCategoria(categoria) {
   </button>
 `;
 
-  snapshot.forEach(doc => {
+  let algunoVisible = false;
 
-    const producto = doc.data();
+  productos.forEach(producto => {
+
+    if (!producto.nombreProducto) return;
+
+    const clave = normalizarNombre(producto.nombreProducto);
+    const tieneMatch = stockPorProducto.hasOwnProperty(clave);
+
+    // 🔒 SIN MATCH EN INVENTARIO = NO DISPONIBLE
+    if (!tieneMatch) return;
+
+    const stock = stockPorProducto[clave];
+    const sinStock = stock <= 0;
+
+    let claseStock = "stock-ok";
+    let textoStock = `${stock} disp.`;
+
+    if (stock <= 0) { claseStock = "stock-agotado"; textoStock = "Agotado"; }
+    else if (stock <= 3) { claseStock = "stock-bajo"; }
+
+    algunoVisible = true;
 
     html += `
       <button
-        class="btn-producto"
-        onclick="agregarProducto('${producto.nombreProducto}', ${producto.precio})">
+        class="btn-producto ${sinStock ? "producto-inactivo" : ""}"
+        ${sinStock ? "disabled" : `onclick="agregarProducto('${producto.nombreProducto}', ${producto.precio})"`}>
 
-        <strong>${producto.nombreProducto}</strong>
-        <br>
-        $${formatoMiles(producto.precio)}
+        <span class="producto-nombre">${producto.nombreProducto}</span>
+        <span class="producto-precio">$${formatoMiles(producto.precio)}</span>
+        <span class="producto-stock ${claseStock}">${textoStock}</span>
 
       </button>
     `;
   });
 
+  if (!algunoVisible) {
+    html += `<p style="padding:20px;opacity:0.7;">No se encontraron productos</p>`;
+  }
+
   document.getElementById("listaProductos").innerHTML = html;
 }
+
 function volverCategorias() {
+
+  categoriaActualVendedor = null;
+
+  const buscador = document.getElementById("buscador");
+  if (buscador) buscador.value = "";
 
   document.getElementById("categoriasProductos").style.display = "block";
 
   document.getElementById("listaProductos").innerHTML = "";
+}
+
+// 🔄 refresca lo que se esté viendo (categoría abierta o búsqueda activa)
+// sin perder el contexto en el que está el vendedor
+async function refrescarVistaProductos() {
+  const buscador = document.getElementById("buscador");
+
+  if (buscador && buscador.value.trim() !== "") {
+    await filtrarProductos();
+  } else if (categoriaActualVendedor) {
+    await mostrarProductosCategoria(categoriaActualVendedor);
+  }
+  // si está viendo la lista de categorías, no hay nada que refrescar ahí
 }
 //Cierre del día 
 async function cierreDelDia() {
@@ -692,6 +1118,9 @@ async function cierreDelDia() {
 
     if (!esHoy) return;
 
+    // 🔒 las ventas anuladas no cuentan en el cierre de caja
+    if (v.anulada) return;
+
     const totalVenta = v.total || 0;
     totalGeneral += totalVenta;
 
@@ -699,14 +1128,90 @@ async function cierreDelDia() {
     else otros += totalVenta;
   });
 
+  // 🔒 se guarda para poder usarlo cuando el cajero confirme el cierre
+  window.cierreCalculado = { totalGeneral, efectivo, otros };
+
   document.getElementById("resultadoCierre").innerHTML = `
     <h3>📊 Resumen del día</h3>
     <p>💰 Total vendido: $${formatoMiles(totalGeneral)}</p>
-    <p>💵 Efectivo: $${formatoMiles(efectivo)}</p>
-    <p>💳 Otros: $${formatoMiles(otros)}</p>
+    <p>💵 Efectivo (según sistema): $${formatoMiles(efectivo)}</p>
+    <p>💳 Otros métodos: $${formatoMiles(otros)}</p>
+
+    <div style="margin-top:14px;text-align:left;">
+      <label style="display:block;margin-bottom:4px;">💵 Efectivo contado en caja</label>
+      <input type="text" id="efectivoContado" placeholder="$0" oninput="formatearInput(this)" style="width:100%;margin-top:0;">
+
+      <label style="display:block;margin:10px 0 4px;">📝 Observaciones (opcional)</label>
+      <input type="text" id="observacionesCierre" placeholder="Ej: faltante por vuelto mal dado" style="width:100%;margin-top:0;">
+    </div>
   `;
 
   document.getElementById("modalCierre").style.display = "flex";
+}
+
+// =====================
+// 🔒 GUARDAR CIERRE DE CAJA (historial permanente)
+// =====================
+const PREFIJO_CIERRE = "CZ-";
+const DIGITOS_CIERRE = 5;
+
+async function generarSiguienteIdCierre() {
+  const ref = db.collection("contadores").doc("cierre");
+
+  const nuevoId = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const ultimo = snap.exists ? (snap.data().ultimo || 0) : 0;
+    const siguiente = ultimo + 1;
+
+    tx.set(ref, { ultimo: siguiente }, { merge: true });
+
+    return PREFIJO_CIERRE + String(siguiente).padStart(DIGITOS_CIERRE, "0");
+  });
+
+  return nuevoId;
+}
+
+async function guardarCierreCaja(btn) {
+  if (btn.disabled) return;
+
+  const calculado = window.cierreCalculado;
+  if (!calculado) return mostrarMensaje("Genera el resumen primero");
+
+  const efectivoContadoTexto = document.getElementById("efectivoContado")?.value || "";
+  const efectivoContado = Number(String(efectivoContadoTexto).replace(/\D/g, "")) || 0;
+  const observaciones = document.getElementById("observacionesCierre")?.value || "";
+
+  const textoOriginal = btn.innerHTML;
+
+  try {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="loader"></span> Guardando...';
+
+    const idCierre = await generarSiguienteIdCierre();
+    const diferencia = efectivoContado - calculado.efectivo;
+
+    await db.collection("cierres").add({
+      idCierre,
+      fecha: new Date(),
+      totalSistema: calculado.totalGeneral,
+      efectivoSistema: calculado.efectivo,
+      otrosSistema: calculado.otros,
+      efectivoContado,
+      diferencia,
+      observaciones
+    });
+
+    mostrarMensaje(`Cierre guardado ✅ (${idCierre})`);
+    cerrarCierre();
+
+  } catch (error) {
+    console.error(error);
+    mostrarMensaje("Error al guardar el cierre ❌");
+
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = textoOriginal;
+  }
 }
 window.cerrarCierre = function () {
   document.getElementById("modalCierre").style.display = "none";
@@ -718,13 +1223,11 @@ function vaciarCarrito(){
         return;
     }
 
-    if(!confirm("¿Vaciar todo el carrito?")){
-        return;
-    }
+    confirmarAccion("¿Vaciar todo el carrito?", () => {
+        carrito={};
+        total=0;
 
-    carrito={};
-    total=0;
-
-    actualizarTotal();
-    actualizarCarrito();
+        actualizarTotal();
+        actualizarCarrito();
+    });
 }
