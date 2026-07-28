@@ -107,9 +107,9 @@ img {
 .logo-text {
   font-family: 'Sora', sans-serif;
   font-weight: 700;
-  font-size: 20px;
-  color: var(--texto, #fff);
-  letter-spacing: 0.5px;
+  font-size: 28px;
+  color: #ffffff;
+  letter-spacing: 0.3px;
 }
 
 /* ==================================================================
