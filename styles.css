@@ -104,6 +104,13 @@ img {
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--violeta); }
 
+.logo-text {
+  font-family: 'Sora', sans-serif;
+  font-weight: 700;
+  font-size: 20px;
+  color: var(--texto, #fff);
+  letter-spacing: 0.5px;
+}
 
 /* ==================================================================
    3. UTILIDADES GENERALES (compartidas por Admin y Vendedor)
